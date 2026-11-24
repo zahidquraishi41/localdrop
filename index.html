@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LocalDrop</title>
+  <style>
+    * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
+    body {
+      margin: 0; background: #0f172a; color: #f8fafc;
+      display: flex; flex-direction: column; align-items: center;
+      min-height: 100vh; padding: 2rem;
+    }
+    h1 { margin: 0 0 0.5rem; font-weight: 700; letter-spacing: -0.5px; }
+    .badge {
+      background: #1e293b; color: #38bdf8; padding: 0.4rem 1rem;
+      border-radius: 999px; font-size: 0.9rem; margin-bottom: 2.5rem;
+      border: 1px solid #334155;
+    }
+    .radar {
+      display: flex; flex-wrap: wrap; gap: 1.5rem; justify-content: center;
+      max-width: 700px; width: 100%;
+    }
+    .peer-card {
+      background: #1e293b; border: 2px solid #334155; border-radius: 16px;
+      padding: 1.5rem; width: 180px; text-align: center; cursor: pointer;
+      transition: transform 0.15s, border-color 0.15s, background 0.15s;
+    }
+    .peer-card:hover, .peer-card.dragover {
+      transform: translateY(-4px); border-color: #38bdf8; background: #1e293b;
+    }
+    .avatar {
+      width: 56px; height: 56px; border-radius: 50%; background: #0284c7;
+      display: flex; align-items: center; justify-content: center;
+      margin: 0 auto 0.75rem; font-size: 1.5rem; font-weight: bold;
+    }
+    .peer-name { font-weight: 600; font-size: 1rem; }
+    .peer-hint { font-size: 0.75rem; color: #94a3b8; margin-top: 0.3rem; }
+    #status {
+      margin-top: 2rem; color: #94a3b8; font-size: 0.95rem; text-align: center;
+      max-width: 520px; line-height: 1.5;
+    }
+    .actions {
+      display: flex; gap: 0.75rem; margin-top: 1rem; align-items: center;
+    }
+    #cancel-btn {
+      display: none; padding: 0.55rem 1.25rem;
+      background: #dc2626; color: #fff; border: none; border-radius: 8px;
+      font-size: 0.9rem; font-weight: 600; cursor: pointer;
+    }
+    #cancel-btn:hover { background: #b91c1c; }
+    #manual-dl {
+      display: none; padding: 0.55rem 1.25rem;
+      background: #0284c7; color: #fff; text-decoration: none; border-radius: 8px;
+      font-size: 0.9rem; font-weight: 600;
+    }
+    .qr-box {
+      margin-top: auto; padding-top: 2.5rem;
+      display: flex; flex-direction: column; align-items: center; gap: 0.5rem;
+    }
+    .qr-box img {
+      width: 148px; height: 148px; border-radius: 12px;
+      border: 4px solid #334155; background: #fff;
+    }
+    .qr-url {
+      font-size: 0.8rem; color: #94a3b8; font-family: monospace;
+    }
+    input[type="file"] { display: none; }
+  </style>
+</head>
+<body>
+  <h1>LocalDrop</h1>
+  <div class="badge" id="my-info">Connecting to local network...</div>
+
+  <div class="radar" id="peer-list"></div>
+  <div id="status">Open this URL on another device on the same Wi-Fi to start sharing.</div>
+  <div class="actions">
+    <a id="manual-dl" href="#">Save File</a>
+    <button id="cancel-btn" type="button">Cancel Transfer</button>
+  </div>
+
+  <div class="qr-box">
+    <img id="qr-img" src="/qr.svg" alt="Scan QR to connect" />
+    <div class="qr-url" id="qr-url"></div>
+  </div>
+
+  <!-- Hidden iframe triggers native Android / Browser Download Manager without leaving the page -->
+  <iframe id="dl-frame" style="display:none;"></iframe>
+
+  <!-- Generic binary MIME type prevents Android Brave from triggering camera/video capture intents -->
+  <input
+    type="file"
+    id="file-input"
+    multiple
+    accept="application/octet-stream"
+  />
+
+  <script>
+    const fileInput = document.getElementById('file-input');
+    const statusEl = document.getElementById('status');
+    const cancelBtn = document.getElementById('cancel-btn');
+    const manualDl = document.getElementById('manual-dl');
+    const dlFrame = document.getElementById('dl-frame');
+    const qrImg = document.getElementById('qr-img');
+    const qrUrl = document.getElementById('qr-url');
+
+    let selectedPeerId = null;
+    let activeTransfer = null; // { tid, role: 'sender'|'receiver', cancel: fn }
+
+    let myId = sessionStorage.getItem('localdrop_id');
+    if (!myId) {
+      myId = Math.random().toString(36).substring(2, 10);
+      sessionStorage.setItem('localdrop_id', myId);
+    }
+
+    const events = new EventSource(`/events?id=${myId}`);
+    window.addEventListener('pagehide', () => events.close());
+
+    // Force a real reload if restored from mobile browser memory/bfcache
+    window.addEventListener('pageshow', (event) => {
+      if (event.persisted) {
+        window.location.reload();
+      }
+    });
+
+    // Immediately reflect when server.py is offline or unreachable
+    events.onerror = () => {
+      document.getElementById('my-info').textContent = 'Offline — Server unreachable';
+      document.getElementById('peer-list').innerHTML = '';
+      if (!activeTransfer) {
+        statusEl.textContent = 'Cannot reach LocalDrop server. Make sure server.py is running.';
+      }
+    };
+
+    function formatSize(bytes) {
+      if (!bytes) return '';
+      const units = ['B', 'KB', 'MB', 'GB'];
+      let i = 0;
+      while (bytes >= 1024 && i < units.length - 1) {
+        bytes /= 1024;
+        i++;
+      }
+      return `${bytes.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+    }
+
+    function setTransfer(tx) {
+      activeTransfer = tx;
+      cancelBtn.style.display = tx ? 'inline-block' : 'none';
+      if (!tx) manualDl.style.display = 'none';
+    }
+
+    cancelBtn.onclick = () => {
+      if (!activeTransfer) return;
+      const { tid, cancel } = activeTransfer;
+      if (cancel) cancel();
+      fetch('/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tid, by: myId })
+      });
+      setTransfer(null);
+      statusEl.textContent = 'Transfer cancelled.';
+    };
+
+    events.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+
+      if (msg.type === 'welcome') {
+        document.getElementById('my-info').textContent = `You are: ${msg.name}`;
+        if (msg.url) {
+          qrUrl.textContent = msg.url;
+          qrImg.src = `/qr.svg?t=${Date.now()}`;
+        }
+      }
+      else if (msg.type === 'peers') {
+        renderPeers(msg.peers.filter(p => p.id !== myId));
+      }
+      else if (msg.type === 'incoming-file') {
+        const dlUrl = `/download?tid=${encodeURIComponent(msg.tid)}`;
+        const sizeLabel = msg.size ? ` (${formatSize(msg.size)})` : '';
+        statusEl.textContent = `Downloading "${msg.name}"${sizeLabel} from ${msg.senderName} — check your browser downloads.`;
+
+        // Trigger native Download Manager immediately
+        dlFrame.src = dlUrl;
+        manualDl.href = dlUrl;
+        manualDl.style.display = 'inline-block';
+
+        setTransfer({
+          tid: msg.tid,
+          role: 'receiver',
+          cancel: () => { dlFrame.src = 'about:blank'; }
+        });
+      }
+      else if (msg.type === 'transfer-done') {
+        if (activeTransfer && activeTransfer.tid === msg.tid) {
+          setTransfer(null);
+          statusEl.textContent = `Saved "${msg.name}" to your Downloads folder!`;
+        }
+      }
+      else if (msg.type === 'transfer-cancelled') {
+        if (activeTransfer && activeTransfer.tid === msg.tid) {
+          if (activeTransfer.cancel) activeTransfer.cancel();
+          setTransfer(null);
+          statusEl.textContent = msg.reason || 'Transfer cancelled.';
+        }
+      }
+    };
+
+    function renderPeers(peers) {
+      const container = document.getElementById('peer-list');
+      container.innerHTML = '';
+
+      if (peers.length === 0) {
+        if (!activeTransfer) {
+          statusEl.textContent = 'Scanning local network... No other devices open right now.';
+        }
+        return;
+      }
+
+      if (!activeTransfer) {
+        statusEl.textContent = 'Click or drop files onto a device to send.';
+      }
+
+      peers.forEach(peer => {
+        const card = document.createElement('div');
+        card.className = 'peer-card';
+        card.innerHTML = `
+          <div class="avatar">${peer.name[0]}</div>
+          <div class="peer-name">${peer.name}</div>
+          <div class="peer-hint">Click or drop files</div>
+        `;
+        card.onclick = () => {
+          if (activeTransfer) return;
+          selectedPeerId = peer.id;
+          fileInput.click();
+        };
+
+        // Drag-and-drop support
+        card.ondragover = (e) => {
+          e.preventDefault();
+          card.classList.add('dragover');
+        };
+        card.ondragleave = () => card.classList.remove('dragover');
+        card.ondrop = async (e) => {
+          e.preventDefault();
+          card.classList.remove('dragover');
+          if (activeTransfer || !e.dataTransfer.files.length) return;
+          await sendFiles(peer.id, Array.from(e.dataTransfer.files));
+        };
+
+        container.appendChild(card);
+      });
+    }
+
+    fileInput.onchange = async () => {
+      if (!selectedPeerId || fileInput.files.length === 0) return;
+      const files = Array.from(fileInput.files);
+      fileInput.value = '';
+      await sendFiles(selectedPeerId, files);
+    };
+
+    async function sendFiles(peerId, files) {
+      for (const file of files) {
+        const tid = Math.random().toString(36).substring(2, 12);
+        const ok = await streamSingleFile(peerId, file, tid);
+        if (!ok) break;
+      }
+    }
+
+    function streamSingleFile(peerId, file, tid) {
+      return new Promise((resolve) => {
+        const xhr = new XMLHttpRequest();
+        const startTime = Date.now();
+        let aborted = false;
+
+        setTransfer({
+          tid,
+          role: 'sender',
+          cancel: () => {
+            aborted = true;
+            xhr.abort();
+          }
+        });
+
+        const url = `/upload?tid=${encodeURIComponent(tid)}&from=${encodeURIComponent(myId)}&to=${encodeURIComponent(peerId)}&name=${encodeURIComponent(file.name)}`;
+        xhr.open('POST', url, true);
+
+        xhr.upload.onprogress = (e) => {
+          if (aborted || !e.lengthComputable) return;
+          const pct = Math.min(100, Math.round((e.loaded / e.total) * 100));
+          const elapsedSec = Math.max(0.1, (Date.now() - startTime) / 1000);
+          const speedMBs = (e.loaded / (1024 * 1024) / elapsedSec).toFixed(1);
+          statusEl.textContent = `Sending "${file.name}": ${pct}% (${speedMBs} MB/s)`;
+        };
+
+        xhr.onload = () => {
+          if (aborted) return resolve(false);
+          setTransfer(null);
+          if (xhr.status === 200) {
+            statusEl.textContent = `Sent "${file.name}" successfully!`;
+            resolve(true);
+          } else {
+            statusEl.textContent = `Failed to send "${file.name}".`;
+            resolve(false);
+          }
+        };
+
+        xhr.onerror = () => {
+          if (!aborted) {
+            setTransfer(null);
+            statusEl.textContent = 'Transfer interrupted.';
+          }
+          resolve(false);
+        };
+
+        xhr.onabort = () => resolve(false);
+
+        statusEl.textContent = `Starting transfer for "${file.name}"...`;
+        xhr.send(file);
+      });
+    }
+  </script>
+</body>
+</html>
